@@ -8,28 +8,24 @@
 /dts-v1/;
 
 #include <rpi_pico/rp2040.dtsi>
-#include "adafruit_kb2040-pinctrl.dtsi"
-#include "sparkfun_pro_micro_connector.dtsi"
+#include "adafruit_qt_py_rp2040-pinctrl.dtsi"
+#include "seeed_xiao_connector.dtsi"
 #include <freq.h>
+#include <zephyr/dt-bindings/led/led.h>
 
 / {
 	chosen {
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
 		zephyr,flash-controller = &ssi;
-		zephyr,console = &uart0;
-		zephyr,shell-uart = &uart0;
+		zephyr,console = &uart1;
+		zephyr,shell-uart = &uart1;
 		zephyr,code-partition = &code_partition;
 	};
 
 	aliases {
 		watchdog0 = &wdt0;
-	};
-
-	xtal_clk: xtal-clk {
-		compatible = "fixed-clock";
-		clock-frequency = <12000000>;
-		#clock-cells = <0>;
+		led-strip = &ws2812;
 	};
 };
 
@@ -53,35 +49,62 @@
 		 * size is 8MB minus the 0x100 bytes taken by the bootloader.
 		 */
 		code_partition: partition@100 {
-			label = "code";
+			label = "code-partition";
 			reg = <0x100 (DT_SIZE_M(8) - 0x100)>;
 			read-only;
 		};
 	};
 };
 
-&uart0 {
+&clocks {
+	pinctrl-0 = <&clocks_default>;
+	pinctrl-names = "default";
+};
+
+&uart1 {
 	current-speed = <115200>;
 	status = "okay";
-	pinctrl-0 = <&uart0_default>;
+	pinctrl-0 = <&uart1_default>;
 	pinctrl-names = "default";
-};
-
-&spi0 {
-	status = "okay";
-	pinctrl-0 = <&spi0_default>;
-	pinctrl-names = "default";
-	clock-frequency = <DT_FREQ_M(8)>;
-};
-
-&i2c1 {
-	status = "okay";
-	pinctrl-0 = <&i2c1_default>;
-	pinctrl-names = "default";
-	clock-frequency = <I2C_BITRATE_FAST>;
 };
 
 &gpio0 {
+	status = "okay";
+
+	/*
+	 * Unlike some of the other Adafruit boards, the neopixel on this board has
+	 * its positive side hooked up to a GPIO pin rather than a positive voltage
+	 * rail to save on power. This will enable the LED on board initialization.
+	 */
+	neopixel-power-enable {
+		gpio-hog;
+		gpios = <11 GPIO_ACTIVE_HIGH>;
+		output-high;
+	};
+};
+
+&i2c0 {
+	clock-frequency = <I2C_BITRATE_FAST>;
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+};
+
+&i2c1 {
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-names = "default";
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+};
+
+&spi0 {
+	clock-frequency = <DT_FREQ_M(8)>;
+	status = "okay";
+	pinctrl-0 = <&spi0_default>;
+	pinctrl-names = "default";
+};
+
+&timer {
 	status = "okay";
 };
 
@@ -97,17 +120,25 @@
 
 &pio0 {
 	status = "okay";
+};
 
+&pio1 {
+	status = "okay";
+
+	/*
+	 * Need to put this on PIO1 as having this on PIO0 causes the GPIO hog to
+	 * not work.
+	 */
 	pio-ws2812 {
 		compatible = "worldsemi,ws2812-rpi_pico-pio";
 		status = "okay";
-		pinctrl-0 = <&ws2812_pio0_default>;
+		pinctrl-0 = <&ws2812_pio1_default>;
 		pinctrl-names = "default";
 		bit-waveform = <3>, <3>, <4>;
 
 		ws2812: ws2812 {
 			status = "okay";
-			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
 			chain-length = <1>;
 			color-mapping = <LED_COLOR_ID_GREEN
 					 LED_COLOR_ID_RED
