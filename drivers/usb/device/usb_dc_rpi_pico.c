@@ -17,6 +17,8 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/irq.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/pinctrl.h>
 
 LOG_MODULE_REGISTER(udc_rpi, CONFIG_USB_DRIVER_LOG_LEVEL);
 
@@ -26,6 +28,8 @@ LOG_MODULE_REGISTER(udc_rpi, CONFIG_USB_DRIVER_LOG_LEVEL);
 #define USB_IRQ DT_INST_IRQ_BY_NAME(0, usbctrl, irq)
 #define USB_IRQ_PRI DT_INST_IRQ_BY_NAME(0, usbctrl, priority)
 #define USB_NUM_BIDIR_ENDPOINTS DT_INST_PROP(0, num_bidir_endpoints)
+#define CLK_DRV DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(0))
+#define CLK_ID (clock_control_subsys_t)DT_INST_PHA_BY_IDX(0, clocks, 0, clk_id)
 
 #define DATA_BUFFER_SIZE 64U
 
@@ -46,6 +50,16 @@ struct udc_rpi_ep_state {
 	uint8_t *buf;
 	uint8_t next_pid;
 };
+
+#define USB_RPI_PICO_PINCTRL_DT_INST_DEFINE(n)                                                     \
+	COND_CODE_1(DT_INST_PINCTRL_HAS_NAME(n, default), (PINCTRL_DT_INST_DEFINE(n)), ())
+
+#define USB_RPI_PICO_PINCTRL_DT_INST_DEV_CONFIG_GET(n)                                             \
+	COND_CODE_1(DT_INST_PINCTRL_HAS_NAME(n, default),                                          \
+			((void *)PINCTRL_DT_INST_DEV_CONFIG_GET(n)), (NULL))
+
+USB_RPI_PICO_PINCTRL_DT_INST_DEFINE(0);
+const struct pinctrl_dev_config *pcfg = USB_RPI_PICO_PINCTRL_DT_INST_DEV_CONFIG_GET(0);
 
 #define USBD_THREAD_STACK_SIZE 1024
 
@@ -91,10 +105,10 @@ static struct udc_rpi_ep_state *udc_rpi_get_ep_state(uint8_t ep)
 	return ep_state_base + USB_EP_GET_IDX(ep);
 }
 
-static int udc_rpi_start_xfer(uint8_t ep, const void *data, size_t len)
+static int udc_rpi_start_xfer(uint8_t ep, const void *data, const size_t len)
 {
 	struct udc_rpi_ep_state *ep_state = udc_rpi_get_ep_state(ep);
-	uint32_t val = len | USB_BUF_CTRL_AVAIL;
+	uint32_t val = len;
 
 	if (*ep_state->buf_ctl & USB_BUF_CTRL_AVAIL) {
 		LOG_WRN("ep 0x%02x was already armed", ep);
@@ -118,6 +132,14 @@ static int udc_rpi_start_xfer(uint8_t ep, const void *data, size_t len)
 
 	ep_state->next_pid ^= 1u;
 	*ep_state->buf_ctl = val;
+	/*
+	 * By default, clk_sys runs at 125MHz, wait 3 nop instructions before
+	 * setting the AVAILABLE bit. See 4.1.2.5.1. Concurrent access.
+	 */
+	arch_nop();
+	arch_nop();
+	arch_nop();
+	*ep_state->buf_ctl = val | USB_BUF_CTRL_AVAIL;
 
 	return 0;
 }
@@ -281,7 +303,7 @@ static void udc_rpi_isr(const void *arg)
 	struct cb_msg msg;
 
 	if ((status & (USB_INTS_BUFF_STATUS_BITS | USB_INTS_SETUP_REQ_BITS)) &&
-	    state.rwu_pending) {
+			state.rwu_pending) {
 		/* The rpi pico USB device does not appear to be sending
 		 * USB_INTR_DEV_RESUME_FROM_HOST interrupts when the resume is
 		 * a result of a remote wakeup request sent by us.
@@ -312,17 +334,41 @@ static void udc_rpi_isr(const void *arg)
 
 	if (status & USB_INTS_DEV_CONN_DIS_BITS) {
 		LOG_DBG("buf %u ep %u", *udc_rpi_get_ep_state(0x81)->buf_ctl,
-			*udc_rpi_get_ep_state(0x81)->ep_ctl);
+				*udc_rpi_get_ep_state(0x81)->ep_ctl);
 		handled |= USB_INTS_DEV_CONN_DIS_BITS;
 		hw_clear_alias(usb_hw)->sie_status = USB_SIE_STATUS_CONNECTED_BITS;
 
 		msg.ep = 0U;
 		msg.ep_event = false;
 		msg.type = usb_hw->sie_status & USB_SIE_STATUS_CONNECTED_BITS ?
-			USB_DC_DISCONNECTED :
-			USB_DC_CONNECTED;
+			USB_DC_CONNECTED :
+			USB_DC_DISCONNECTED;
+
+		/* VBUS detection does not always detect the detach.
+		 * Check on disconnect if VBUS is still attached
+		 */
+		if (pcfg != NULL && msg.type == USB_DC_DISCONNECTED &&
+				(usb_hw->sie_status & USB_SIE_STATUS_VBUS_DETECTED_BITS) == 0) {
+			LOG_DBG("Disconnected. Disabling pull-up");
+			hw_clear_alias(usb_hw)->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+		}
 
 		k_msgq_put(&usb_dc_msgq, &msg, K_NO_WAIT);
+	}
+
+	if (status & USB_INTS_VBUS_DETECT_BITS) {
+		handled |= USB_INTS_VBUS_DETECT_BITS;
+		hw_clear_alias(usb_hw)->sie_status = USB_SIE_STATUS_VBUS_DETECTED_BITS;
+
+		if (pcfg != NULL) {
+			if (usb_hw->sie_status & USB_SIE_STATUS_VBUS_DETECTED_BITS) {
+				LOG_DBG("VBUS attached. Enabling pull-up");
+				hw_set_alias(usb_hw)->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+			} else {
+				LOG_DBG("VBUS detached. Disabling pull-up");
+				hw_clear_alias(usb_hw)->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+			}
+		}
 	}
 
 	if (status & USB_INTS_BUS_RESET_BITS) {
@@ -415,6 +461,17 @@ static void udc_rpi_init_endpoint(const uint8_t i)
 
 static int udc_rpi_init(void)
 {
+	int ret;
+
+	/* Apply the pinctrl */
+	if (pcfg != NULL) {
+		ret = pinctrl_apply_state(pcfg, PINCTRL_STATE_DEFAULT);
+		if (ret != 0) {
+			LOG_ERR("Failed to apply pincfg: %d", ret);
+			return ret;
+		}
+	}
+
 	/* Reset usb controller */
 	reset_block(RESETS_RESET_USBCTRL_BITS);
 	unreset_block_wait(RESETS_RESET_USBCTRL_BITS);
@@ -426,8 +483,11 @@ static int udc_rpi_init(void)
 	/* Mux the controller to the onboard usb phy */
 	usb_hw->muxing = USB_USB_MUXING_TO_PHY_BITS | USB_USB_MUXING_SOFTCON_BITS;
 
-	/* Force VBUS detect so the device thinks it is plugged into a host */
-	usb_hw->pwr = USB_USB_PWR_VBUS_DETECT_BITS | USB_USB_PWR_VBUS_DETECT_OVERRIDE_EN_BITS;
+	if (pcfg == NULL) {
+		/* Force VBUS detect so the device thinks it is plugged into a host */
+		usb_hw->pwr =
+			USB_USB_PWR_VBUS_DETECT_BITS | USB_USB_PWR_VBUS_DETECT_OVERRIDE_EN_BITS;
+	}
 
 	/* Enable the USB controller in device mode. */
 	usb_hw->main_ctrl = USB_MAIN_CTRL_CONTROLLER_EN_BITS;
@@ -439,12 +499,12 @@ static int udc_rpi_init(void)
 	 * and when a setup packet is received, and device connection status
 	 */
 	usb_hw->inte = USB_INTS_BUFF_STATUS_BITS | USB_INTS_BUS_RESET_BITS |
-		       USB_INTS_DEV_CONN_DIS_BITS |
-		       USB_INTS_SETUP_REQ_BITS | /*USB_INTS_EP_STALL_NAK_BITS |*/
-		       USB_INTS_ERROR_BIT_STUFF_BITS | USB_INTS_ERROR_CRC_BITS |
-		       USB_INTS_ERROR_DATA_SEQ_BITS | USB_INTS_ERROR_RX_OVERFLOW_BITS |
-		       USB_INTS_ERROR_RX_TIMEOUT_BITS | USB_INTS_DEV_SUSPEND_BITS |
-		       USB_INTR_DEV_RESUME_FROM_HOST_BITS;
+		USB_INTS_DEV_CONN_DIS_BITS |
+		USB_INTS_SETUP_REQ_BITS | /*USB_INTS_EP_STALL_NAK_BITS |*/
+		USB_INTS_ERROR_BIT_STUFF_BITS | USB_INTS_ERROR_CRC_BITS |
+		USB_INTS_ERROR_DATA_SEQ_BITS | USB_INTS_ERROR_RX_OVERFLOW_BITS |
+		USB_INTS_ERROR_RX_TIMEOUT_BITS | USB_INTS_DEV_SUSPEND_BITS |
+		USB_INTR_DEV_RESUME_FROM_HOST_BITS | USB_INTE_VBUS_DETECT_BITS;
 
 	/* Set up endpoints (endpoint control registers)
 	 * described by device configuration
@@ -454,8 +514,18 @@ static int udc_rpi_init(void)
 		udc_rpi_init_endpoint(i);
 	}
 
-	/* Present full speed device by enabling pull up on DP */
-	hw_set_alias(usb_hw)->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+	/* Self powered devices must enable the pull up only if vbus is detected.
+	 * If the pull-up is not enabled here, this will be handled by the USB_INTS_VBUS_DETECT
+	 * interrupt.
+	 */
+	if (usb_hw->sie_status & USB_SIE_STATUS_VBUS_DETECTED_BITS) {
+		LOG_DBG("Enabling pull-up");
+		/* Present full speed device by enabling pull up on DP */
+		hw_set_alias(usb_hw)->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+	}
+
+	IRQ_CONNECT(USB_IRQ, USB_IRQ_PRI, udc_rpi_isr, 0, 0);
+	irq_enable(USB_IRQ);
 
 	return 0;
 }
@@ -522,7 +592,7 @@ int usb_dc_ep_check_cap(const struct usb_dc_ep_cfg_data *const cfg)
 	uint8_t ep_idx = USB_EP_GET_IDX(cfg->ep_addr);
 
 	LOG_DBG("ep %x, mps %d, type %d",
-		cfg->ep_addr, cfg->ep_mps, cfg->ep_type);
+			cfg->ep_addr, cfg->ep_mps, cfg->ep_type);
 
 	if ((cfg->ep_type == USB_DC_EP_CONTROL) && ep_idx) {
 		LOG_ERR("invalid endpoint configuration");
@@ -547,8 +617,8 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data *const ep_cfg)
 	}
 
 	LOG_DBG("ep 0x%02x, previous mps %u, mps %u, type %u",
-		ep_cfg->ep_addr, ep_state->mps,
-		ep_cfg->ep_mps, ep_cfg->ep_type);
+			ep_cfg->ep_addr, ep_state->mps,
+			ep_cfg->ep_mps, ep_cfg->ep_type);
 
 	ep_state->mps = ep_cfg->ep_mps;
 	ep_state->type = ep_cfg->ep_type;
@@ -637,9 +707,9 @@ int usb_dc_ep_enable(const uint8_t ep)
 
 	LOG_DBG("ep 0x%02x (id: %d) -> type %d", ep, USB_EP_GET_IDX(ep), ep_state->type);
 
-	/* clear buffer state (EP0 starts with PID=1 for setup phase) */
-
-	*ep_state->buf_ctl = (USB_EP_GET_IDX(ep) == 0 ? USB_BUF_CTRL_DATA1_PID : 0);
+	/* clear buffer state */
+	*ep_state->buf_ctl = USB_BUF_CTRL_DATA0_PID;
+	ep_state->next_pid = 0;
 
 	/* EP0 doesn't have an ep_ctl */
 	if (ep_state->ep_ctl) {
@@ -674,6 +744,13 @@ int usb_dc_ep_disable(const uint8_t ep)
 		return 0;
 	}
 
+	/* If this endpoint has previously been used and e.g. the host application
+	 * crashed, the endpoint may remain locked even after reconfiguration
+	 * because the write semaphore is never given back.
+	 * udc_rpi_cancel_endpoint() handles this so the endpoint can be written again.
+	 */
+	udc_rpi_cancel_endpoint(ep);
+
 	uint8_t val = *ep_state->ep_ctl & ~EP_CTRL_ENABLE_BITS;
 
 	*ep_state->ep_ctl = val;
@@ -682,7 +759,7 @@ int usb_dc_ep_disable(const uint8_t ep)
 }
 
 int usb_dc_ep_write(const uint8_t ep, const uint8_t *const data,
-		    const uint32_t data_len, uint32_t *const ret_bytes)
+		const uint32_t data_len, uint32_t *const ret_bytes)
 {
 	struct udc_rpi_ep_state *ep_state = udc_rpi_get_ep_state(ep);
 	uint32_t len = data_len;
@@ -751,7 +828,7 @@ uint32_t udc_rpi_get_ep_buffer_len(const uint8_t ep)
 }
 
 int usb_dc_ep_read_wait(uint8_t ep, uint8_t *data,
-			uint32_t max_data_len, uint32_t *read_bytes)
+		uint32_t max_data_len, uint32_t *read_bytes)
 {
 	struct udc_rpi_ep_state *ep_state = udc_rpi_get_ep_state(ep);
 	uint32_t read_count;
@@ -770,14 +847,14 @@ int usb_dc_ep_read_wait(uint8_t ep, uint8_t *data,
 		read_count = sizeof(struct usb_setup_packet);
 		if (read_count != max_data_len) {
 			LOG_WRN("Attempting to read setup packet with the wrong length"
-				" (expected: %d, read: %d)", read_count, max_data_len);
+					" (expected: %d, read: %d)", read_count, max_data_len);
 		}
 	} else {
 		read_count = udc_rpi_get_ep_buffer_len(ep) - ep_state->read_offset;
 	}
 
 	LOG_DBG("ep 0x%02x, %u bytes, %u+%u, %p", ep, max_data_len, ep_state->read_offset,
-		read_count, data);
+			read_count, (void *)data);
 
 	if (data) {
 		read_count = MIN(read_count, max_data_len);
@@ -801,13 +878,13 @@ int usb_dc_ep_read_wait(uint8_t ep, uint8_t *data,
 }
 
 static int usb_dc_control_ep_read_continue(const struct udc_rpi_ep_state *const ep_state,
-					   bool *const arm_out_endpoint)
+		bool *const arm_out_endpoint)
 {
 	const struct usb_setup_packet *const setup = (const void *)&usb_dpram->setup_packet;
 
 	if (state.setup_available) {
 		LOG_DBG("EP0 setup (wLength=%d, is_to_device=%d)",
-			setup->wLength, usb_reqtype_is_to_device(setup));
+				setup->wLength, usb_reqtype_is_to_device(setup));
 		if (setup->wLength != 0U) {
 			/* In the case of a control transfer, we want to prime the OUT endpoint
 			 * exactly once, to either:
@@ -826,7 +903,7 @@ static int usb_dc_control_ep_read_continue(const struct udc_rpi_ep_state *const 
 		const size_t len = udc_rpi_get_ep_buffer_len(USB_CONTROL_EP_OUT);
 
 		LOG_DBG("Control OUT received %u offset: %u",
-			len, ep_state->read_offset);
+				len, ep_state->read_offset);
 		if (usb_reqtype_is_to_device(setup)) {
 			if (state.control_out_ep_rcvd + ep_state->read_offset < setup->wLength) {
 				/* If no more data in the buffer, but we're still waiting
@@ -861,7 +938,7 @@ int usb_dc_ep_read_continue(const uint8_t ep)
 		const size_t len = udc_rpi_get_ep_buffer_len(ep);
 
 		LOG_DBG("Endpoint 0x%02x received %u offset: %u",
-			ep, len, ep_state->read_offset);
+				ep, len, ep_state->read_offset);
 		/* If no more data in the buffer, start a new read transaction. */
 		if (len == ep_state->read_offset) {
 			arm_out_endpoint = true;
@@ -879,7 +956,7 @@ int usb_dc_ep_read_continue(const uint8_t ep)
 }
 
 int usb_dc_ep_read(const uint8_t ep, uint8_t *const data,
-		   const uint32_t max_data_len, uint32_t *const read_bytes)
+		const uint32_t max_data_len, uint32_t *const read_bytes)
 {
 	if (usb_dc_ep_read_wait(ep, data, max_data_len, read_bytes) != 0) {
 		return -EINVAL;
@@ -985,6 +1062,7 @@ static void udc_rpi_thread_main(void *arg1, void *unused1, void *unused2)
 
 static int usb_rpi_init(void)
 {
+	int ret;
 
 	k_thread_create(&thread, thread_stack,
 			USBD_THREAD_STACK_SIZE,
@@ -992,8 +1070,10 @@ static int usb_rpi_init(void)
 			K_PRIO_COOP(2), 0, K_NO_WAIT);
 	k_thread_name_set(&thread, "usb_rpi");
 
-	IRQ_CONNECT(USB_IRQ, USB_IRQ_PRI, udc_rpi_isr, 0, 0);
-	irq_enable(USB_IRQ);
+	ret = clock_control_on(CLK_DRV, CLK_ID);
+	if (ret < 0) {
+		return ret;
+	}
 
 	return 0;
 }
