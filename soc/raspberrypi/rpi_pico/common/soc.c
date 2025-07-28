@@ -18,8 +18,20 @@
 
 #include <zephyr/fatal.h>
 #include <zephyr/logging/log.h>
+#include <cmsis_core.h>
+#include <pico/bootrom.h>
 
 LOG_MODULE_REGISTER(soc, CONFIG_SOC_LOG_LEVEL);
+
+/* Overrides the weak ARM implementation:
+   Set general purpose retention register and reboot */
+void sys_arch_reboot(int type) {
+	if (type != 0) {
+		reset_usb_boot(0,0);
+	} else {
+		NVIC_SystemReset();
+	}
+}
 
 /*
  * Some pico-sdk drivers call panic on fatal error.
